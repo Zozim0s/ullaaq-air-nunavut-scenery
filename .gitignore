@@ -1,0 +1,47 @@
+cat > .gitignore <<'EOF'
+# Large/source geospatial datasets
+/source/
+
+# Generated and temporary working data
+/work/
+
+# Reference datasets and extracted third-party material
+/reference/
+
+# Generated scenery output
+/output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS debris
+*~
+*.swp
+.DS_Store
+
+# Large X-Plane / geospatial artifacts wherever they appear
+*.dsf
+*.raw
+*.tif
+*.tiff
+*.dds
+*.jpg
+*.jpeg
+*.png
+*.mesh
+*.node
+*.poly
+*.alt
+*.apt
+*.osm
+*.osm.bz2
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+EOF
