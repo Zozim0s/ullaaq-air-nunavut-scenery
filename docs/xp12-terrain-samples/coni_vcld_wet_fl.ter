@@ -1,0 +1,15 @@
+A
+800
+TERRAIN
+
+BASE_TEX ../textures10/hiveg/coni_tmp_wet_flat_c.dds
+BORDER_TEX ../textures10/border/hard.png
+PROJECTED 1846 1846
+SUPER_ROUGHNESS 0.5
+COMPOSITE_TEX ../textures10/hiveg/broadl_tmp_wet_sflat_d.dds
+COMPOSITE_PROJECTED 1777 1777
+COMPOSITE_PARAMS 0.104000 0.850000 0.248000 1.820000 2.050000 0.260000
+COMPOSITE_NOISE ../textures10/shared/fornoise.png
+NO_ALPHA
+COMPOSITE_BORDERS
+DECAL_LIB lib/g10/decals/grass_and_stony_dirt_1.dcl

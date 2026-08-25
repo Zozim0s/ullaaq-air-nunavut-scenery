@@ -1,0 +1,14 @@
+A
+800
+TERRAIN
+
+BASE_TEX ../textures10/loveg/sprs_cld_sdry_steep_d.dds
+BORDER_TEX ../textures10/border/soft.png
+PROJECTED 2871 2871
+SUPER_ROUGHNESS 0.5
+AUTO_SLOPE_HEADING
+AUTO_SLOPE_HILL 2871 2871 30 35 ../textures10/loveg/sprs_cld_sdry_steep_d.dds
+AUTO_SLOPE_CLIFF 1361 1361 57 62 ../textures10/soil/cliff_pol.dds
+NO_ALPHA
+COMPOSITE_BORDERS
+DECAL_LIB lib/g10/decals/maquify_1_alpha_key.dcl

@@ -1,4 +1,3 @@
-cat > .gitignore <<'EOF'
 # Large/source geospatial datasets
 /source/
 
@@ -44,4 +43,6 @@ venv/
 *.tar
 *.tar.gz
 *.7z
-EOF
+
+# Machine-local project paths
+/config/paths.env

@@ -1,0 +1,17 @@
+A
+800
+TERRAIN
+
+BASE_TEX ../textures10/loveg/grass_cld_sdry_flat_c.dds
+BORDER_TEX ../textures10/border/med.png
+PROJECTED 1277 1277
+SUPER_ROUGHNESS 0.5
+COMPOSITE_TEX ../textures10/loveg/tund_grass_cld_wet_flat_c2.dds
+COMPOSITE_PROJECTED 3028 3028
+COMPOSITE_PARAMS 0.104000 0.850000 0.248000 1.820000 2.050000 0.260000
+COMPOSITE_NOISE ../textures10/shared/natnoise.png
+NO_ALPHA
+COMPOSITE_BORDERS
+DECAL_LIB lib/g10/decals/long_grass_and_gravel_1.dcl
+DECAL_LIB lib/g10/decals/low_freq_mod_1.dcl
+NORMAL_TEX 20,000000 ../textures10/shared/clumpy_turf4_NML.png

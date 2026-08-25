@@ -1,0 +1,1 @@
+Ortho4XP custom GeoTIFF DEM failure: Ortho4XP's Python environment lacked the GDAL bindings (osgeo). O4_DEM_Utils therefore had has_gdal = False and silently generated a 3601×3601 zero-altitude fallback raster. Installing matching GDAL Python bindings in the Ortho4XP venv restored GeoTIFF DEM loading. Verified MRDEM → .alt → .mesh, with mesh elevation reaching ~282 m.

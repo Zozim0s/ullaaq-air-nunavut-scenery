@@ -1,0 +1,1374 @@
+#!/usr/bin/env python3
+"""
+Ullaaq landcover boundary injector for Ortho4XP.
+
+Reads semantic landcover polygons from the existing GeoPackage, dissolves
+same-class polygons, optionally simplifies boundaries in the source projected
+CRS, transforms them to WGS84, converts them to Ortho4XP tile-relative
+coordinates, and inserts them into the Vector_Map as DUMMY constrained edges.
+
+This version adds a persistent two-level cache:
+
+1. Each semantic class is cached *after dissolve but before simplification*.
+   Changing the simplification tolerance therefore does not repeat the costly
+   unary_union over tens of thousands of source polygons.
+2. The merged boundary network is cached per simplification tolerance.
+   Re-running Step 1 with the same tolerance skips the GIS preprocessing almost
+   entirely and goes straight to Ortho4XP edge insertion.
+
+The cache is automatically invalidated when the source GeoPackage's size or
+mtime changes. Override the cache directory with ULLAAQ_LANDCOVER_CACHE_DIR.
+Set ULLAAQ_REBUILD_LANDCOVER_CACHE=1 to force a rebuild.
+
+The raster classifier remains authoritative for terrain selection in Step 3.
+These boundaries exist only to force Triangle4XP to cut the mesh along
+ecological transitions.
+"""
+
+import json
+import os
+import shutil
+import tempfile
+
+import numpy
+from osgeo import ogr, osr
+from shapely import geometry, ops, wkb
+
+import O4_UI_Utils as UI
+
+ogr.UseExceptions()
+
+DEFAULT_GPKG = os.path.expanduser(
+    "~/linGames/X-Plane 12/Development/Forest Scenery/"
+    "+58-069_NALCMS_2020/+58-069_landcover.gpkg"
+)
+
+LANDCOVER_LAYERS = (
+    "taiga",
+    "shrub_tundra",
+    "grass_tundra",
+    "barren_tundra",
+    "wetland",
+    "town",
+)
+
+# Natural landcover gets cartographic generalization.
+# Town/developed geometry is hand-authored/hardened in the raster and is kept as drawn.
+NATURAL_LAYERS = {
+    "taiga",
+    "shrub_tundra",
+    "grass_tundra",
+    "barren_tundra",
+    "wetland",
+}
+
+# Production geometry recipe selected by QGIS visual/vertex-count testing:
+# Douglas-Peucker simplification at 30 m with sparse-chain guarding, followed by two Chaikin smoothing
+# iterations with offset 0.25. 180 degrees means smooth every eligible node.
+DEFAULT_SIMPLIFY_M = 30.0
+DEFAULT_SMOOTH_ITERATIONS = 2
+DEFAULT_SMOOTH_OFFSET = 0.25
+DEFAULT_SMOOTH_MAX_ANGLE = 180.0
+
+CACHE_VERSION = 3
+CACHE_META = "cache_meta.json"
+
+
+def _ogr_to_shapely(geom):
+    if geom is None or geom.IsEmpty():
+        return None
+    return wkb.loads(bytes(geom.ExportToWkb()))
+
+
+def _to_multilinestring(boundary):
+    if boundary is None or boundary.is_empty:
+        return geometry.MultiLineString()
+
+    if isinstance(boundary, geometry.LineString):
+        return geometry.MultiLineString([boundary])
+
+    if isinstance(boundary, geometry.MultiLineString):
+        return boundary
+
+    if isinstance(boundary, geometry.GeometryCollection):
+        lines = []
+        for g in boundary.geoms:
+            if isinstance(g, geometry.LineString):
+                lines.append(g)
+            elif isinstance(g, geometry.MultiLineString):
+                lines.extend(list(g.geoms))
+        return geometry.MultiLineString(lines)
+
+    return geometry.MultiLineString()
+
+
+def _transform_lines_to_tile_relative(multilines, transform, tile):
+    out = []
+    for line in multilines.geoms:
+        coords = []
+        for x, y in line.coords:
+            p = ogr.Geometry(ogr.wkbPoint)
+            p.AddPoint(float(x), float(y))
+            p.Transform(transform)
+            lon, lat, _ = p.GetPoint()
+            coords.append((lon - tile.lon, lat - tile.lat))
+        if len(coords) >= 2:
+            out.append(geometry.LineString(coords))
+    return geometry.MultiLineString(out)
+
+
+def _existing_hydro_constraint_lines(vector_map):
+    """
+    Recover only Ortho4XP WATER/SEA/SEA_EQUIV edges already present in Vector_Map.
+
+    Vector_Map stores:
+      dico_edges[(nodeid0,nodeid1)] -> edge_id
+      nodes_dico[node_id]           -> (x,y)
+      data_edges[edge_id]           -> bitmask marker
+    """
+    hydro_mask = (
+        vector_map.dico_attributes["WATER"]
+        | vector_map.dico_attributes["SEA"]
+        | vector_map.dico_attributes["SEA_EQUIV"]
+    )
+
+    lines = []
+    for (n1, n2), edge_id in vector_map.dico_edges.items():
+        marker = vector_map.data_edges.get(edge_id, 0)
+        if not (marker & hydro_mask):
+            continue
+
+        try:
+            p1 = vector_map.nodes_dico[n1]
+            p2 = vector_map.nodes_dico[n2]
+        except KeyError:
+            continue
+
+        a = (float(p1[0]), float(p1[1]))
+        b = (float(p2[0]), float(p2[1]))
+        if a != b:
+            lines.append(geometry.LineString([a, b]))
+
+    if not lines:
+        return geometry.MultiLineString()
+
+    return _to_multilinestring(ops.unary_union(lines))
+
+
+def _protect_hydro_constraints(tile_lines, vector_map, clearance_deg=2.0e-6):
+    """
+    Trim Ullaaq DUMMY linework out of a microscopic corridor around Ortho4XP's
+    authoritative water/sea constraints.
+
+    This prevents ecological constraints from coinciding with or crossing the
+    hydro edge itself.  It does NOT yet mask Step-3 semantic terrain assignment
+    inside water; that is a separate downstream task.
+    """
+    hydro = _existing_hydro_constraint_lines(vector_map)
+    if hydro.is_empty:
+        return tile_lines, 0, 0, 0
+
+    before = len(_to_multilinestring(tile_lines).geoms)
+    hydro_count = len(hydro.geoms)
+
+    mask = hydro.buffer(
+        float(clearance_deg),
+        cap_style=2,
+        join_style=2,
+    )
+
+    clipped = _to_multilinestring(tile_lines.difference(mask))
+    after = len(clipped.geoms)
+
+    return clipped, hydro_count, before, after
+
+
+def _source_signature(gpkg_path):
+    st = os.stat(gpkg_path)
+    return {
+        "cache_version": CACHE_VERSION,
+        "source": os.path.abspath(gpkg_path),
+        "source_size": st.st_size,
+        "source_mtime_ns": st.st_mtime_ns,
+        "layers": list(LANDCOVER_LAYERS),
+    }
+
+
+def _default_cache_dir(gpkg_path):
+    stem = os.path.splitext(os.path.basename(gpkg_path))[0]
+    return os.path.join(os.path.dirname(gpkg_path), stem + "_ullaaq_cache")
+
+
+def _cache_dir(gpkg_path):
+    override = os.environ.get("ULLAAQ_LANDCOVER_CACHE_DIR")
+    return os.path.expanduser(override) if override else _default_cache_dir(gpkg_path)
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _atomic_write_bytes(path, data):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".ullaaq-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_write_json(path, obj):
+    data = (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, data)
+
+
+def _save_geom(path, geom):
+    # Hex=False gives compact binary WKB and avoids pickle/Shapely-version issues.
+    _atomic_write_bytes(path, wkb.dumps(geom, hex=False))
+
+
+def _load_geom(path):
+    with open(path, "rb") as f:
+        return wkb.loads(f.read())
+
+
+def _simplify_key(simplify_m):
+    value = float(simplify_m or 0.0)
+    if value == 0:
+        return "0m"
+    # File-name-safe representation without losing useful fractional tolerances.
+    text = ("{:.6f}".format(value)).rstrip("0").rstrip(".")
+    return text.replace("-", "neg_").replace(".", "p") + "m"
+
+
+def _number_key(value):
+    text = ("{:.6f}".format(float(value))).rstrip("0").rstrip(".")
+    return text.replace("-", "neg_").replace(".", "p")
+
+
+def _geometry_key(simplify_m, smooth_iterations, smooth_offset, smooth_max_angle):
+    return "sharedmerge_guard_jmerge75_n4_d75_v5_{}_smooth{}_o{}_a{}".format(
+        _simplify_key(simplify_m),
+        int(smooth_iterations),
+        _number_key(smooth_offset),
+        _number_key(smooth_max_angle),
+    )
+
+
+def _angle_degrees(a, b, c):
+    """Return the smaller angle ABC in degrees."""
+    import math
+
+    bax = a[0] - b[0]
+    bay = a[1] - b[1]
+    bcx = c[0] - b[0]
+    bcy = c[1] - b[1]
+
+    la = math.hypot(bax, bay)
+    lc = math.hypot(bcx, bcy)
+    if la == 0.0 or lc == 0.0:
+        return 180.0
+
+    cosine = (bax * bcx + bay * bcy) / (la * lc)
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
+def _chaikin_ring(coords, offset=0.25, max_angle=180.0):
+    """
+    One QGIS-style Chaikin pass over a closed ring.
+
+    Each eligible vertex is replaced by two points offset along its incident
+    segments. With max_angle=180 every non-degenerate vertex is smoothed.
+    """
+    pts = list(coords)
+    if len(pts) < 4:
+        return pts
+
+    # Shapely rings repeat the first coordinate at the end.
+    if pts[0] == pts[-1]:
+        pts = pts[:-1]
+    n = len(pts)
+    if n < 3:
+        return list(coords)
+
+    out = []
+    off = float(offset)
+    for i, cur in enumerate(pts):
+        prev = pts[(i - 1) % n]
+        nxt = pts[(i + 1) % n]
+
+        if _angle_degrees(prev, cur, nxt) <= float(max_angle):
+            q = (
+                (1.0 - off) * cur[0] + off * prev[0],
+                (1.0 - off) * cur[1] + off * prev[1],
+            )
+            r = (
+                (1.0 - off) * cur[0] + off * nxt[0],
+                (1.0 - off) * cur[1] + off * nxt[1],
+            )
+            out.extend((q, r))
+        else:
+            out.append(cur)
+
+    if out and out[0] != out[-1]:
+        out.append(out[0])
+    return out
+
+
+def _polygon_parts(geom):
+    """Yield Polygon members from any polygonal Shapely geometry."""
+    if geom is None or geom.is_empty:
+        return
+
+    if isinstance(geom, geometry.Polygon):
+        yield geom
+        return
+
+    if isinstance(geom, geometry.MultiPolygon):
+        for poly in geom.geoms:
+            yield poly
+        return
+
+    if isinstance(geom, geometry.GeometryCollection):
+        for part in geom.geoms:
+            if isinstance(
+                part,
+                (geometry.Polygon, geometry.MultiPolygon, geometry.GeometryCollection),
+            ):
+                yield from _polygon_parts(part)
+
+
+def _chaikin_polygon_once(poly, offset=0.25, max_angle=180.0):
+    """Apply exactly one Chaikin pass to one Polygon."""
+    exterior = _chaikin_ring(poly.exterior.coords, offset, max_angle)
+    interiors = [
+        _chaikin_ring(ring.coords, offset, max_angle)
+        for ring in poly.interiors
+    ]
+
+    work = geometry.Polygon(exterior, interiors)
+
+    # Smoothing can create a self-touching ring. GEOS may repair that Polygon
+    # into a MultiPolygon or GeometryCollection, which is valid and expected.
+    if not work.is_valid:
+        work = work.buffer(0)
+
+    return work
+
+
+def _smooth_geometry(geom, iterations=2, offset=0.25, max_angle=180.0):
+    """
+    Apply QGIS-style Chaikin smoothing to polygonal geometry.
+
+    Crucially, every iteration accepts Polygon, MultiPolygon, or
+    GeometryCollection input. A validity repair after one pass is therefore
+    allowed to split a Polygon into several Polygon parts without breaking the
+    next pass.
+    """
+    if geom is None or geom.is_empty or int(iterations) <= 0:
+        return geom
+
+    work = geom
+
+    for _ in range(max(0, int(iterations))):
+        smoothed_parts = []
+
+        for poly in _polygon_parts(work):
+            result = _chaikin_polygon_once(
+                poly,
+                offset=offset,
+                max_angle=max_angle,
+            )
+            smoothed_parts.extend(list(_polygon_parts(result)))
+
+        if not smoothed_parts:
+            return geometry.MultiPolygon()
+
+        if len(smoothed_parts) == 1:
+            work = smoothed_parts[0]
+        else:
+            work = geometry.MultiPolygon(smoothed_parts)
+
+            # Separate parts can occasionally touch/overlap after smoothing.
+            # Repair only when needed; this keeps the common case cheap.
+            if not work.is_valid:
+                work = work.buffer(0)
+
+        if work.is_empty:
+            break
+
+    return work
+
+
+
+def _chaikin_open_line_once(line, offset=0.25, max_angle=180.0):
+    """One Chaikin pass over an open line, with graph endpoints pinned."""
+    pts = list(line.coords)
+    if len(pts) < 3:
+        return line
+    out = [pts[0]]
+    off = float(offset)
+    for i in range(1, len(pts) - 1):
+        prev, cur, nxt = pts[i - 1], pts[i], pts[i + 1]
+        if _angle_degrees(prev, cur, nxt) <= float(max_angle):
+            out.extend((
+                ((1.0-off)*cur[0] + off*prev[0],
+                 (1.0-off)*cur[1] + off*prev[1]),
+                ((1.0-off)*cur[0] + off*nxt[0],
+                 (1.0-off)*cur[1] + off*nxt[1]),
+            ))
+        else:
+            out.append(cur)
+    out.append(pts[-1])
+    return geometry.LineString(out)
+
+
+
+def _linemerge_multilines(multilines):
+    """
+    Merge noded line fragments through degree-2 vertices into maximal chains.
+
+    True junctions remain endpoints. This gives Douglas-Peucker long enough
+    LineStrings to remove the 30 m raster staircase while preserving graph
+    topology at actual class junctions.
+    """
+    ml = _to_multilinestring(multilines)
+    if ml.is_empty:
+        return geometry.MultiLineString()
+
+    merged = ops.linemerge(ml)
+
+    if isinstance(merged, geometry.LineString):
+        return geometry.MultiLineString([merged])
+
+    if isinstance(merged, geometry.MultiLineString):
+        return merged
+
+    if isinstance(merged, geometry.GeometryCollection):
+        lines = []
+        for g in merged.geoms:
+            if isinstance(g, geometry.LineString):
+                lines.append(g)
+            elif isinstance(g, geometry.MultiLineString):
+                lines.extend(g.geoms)
+        return geometry.MultiLineString(lines)
+
+    return geometry.MultiLineString()
+
+
+
+def _simplify_open_chain_guarded(line, simplify_m):
+    """
+    Simplify an open junction-to-junction chain, but avoid collapsing a visibly
+    curved short chain into a 2- or 3-point chord.
+
+    The normal tolerance remains the production tolerance (30 m in this build).
+    Only sparse results whose original geometry departs materially from their
+    endpoint chord are retried locally at 1/2 and, if necessary, 1/4 tolerance.
+    """
+    tol = float(simplify_m or 0.0)
+    if tol <= 0.0 or line.is_empty or len(line.coords) < 3:
+        return line, False
+
+    simplified = line.simplify(tol, preserve_topology=True)
+
+    # Four or more coordinates already give Chaikin enough shape information.
+    if len(simplified.coords) >= 4 or len(line.coords) < 4:
+        return simplified, False
+
+    start = tuple(line.coords[0])
+    end = tuple(line.coords[-1])
+    if start == end:
+        return simplified, False
+
+    chord = geometry.LineString([start, end])
+    deviation = line.hausdorff_distance(chord)
+
+    # If the source chain is nearly straight, the chord is legitimate.
+    # 0.25*tolerance = 7.5 m for the current 30 m recipe.
+    if deviation < 0.25 * tol:
+        return simplified, False
+
+    guarded = simplified
+    for local_tol in (0.5 * tol, 0.25 * tol):
+        candidate = line.simplify(local_tol, preserve_topology=True)
+        guarded = candidate
+        if len(candidate.coords) >= 4:
+            break
+
+    return guarded, True
+
+
+
+
+def _collapse_connected_junction_clusters(
+    multilines,
+    max_edge_m=75.0,
+    max_cluster_diameter_m=75.0,
+    max_cluster_nodes=4,
+    max_result_degree=5,
+):
+    """
+    Conservatively collapse only genuinely local junction micro-clusters.
+
+    Candidate junctions must be degree-3+ and directly connected by short graph
+    edges.  Unlike the previous experiment, transitive connected components are
+    rejected unless the WHOLE component also satisfies hard limits on:
+
+      * total junction-node count,
+      * maximum pairwise cluster diameter, and
+      * resulting external valence after collapse.
+
+    This prevents chains of individually short edges from percolating into a
+    large star node.
+    """
+    import math
+
+    ml = _to_multilinestring(multilines)
+    lines = [g for g in ml.geoms if not g.is_empty and len(g.coords) >= 2]
+    if not lines:
+        return ml, 0, 0, 0, 0, 0
+
+    degree = {}
+    endpoints = []
+    for line in lines:
+        a = tuple(line.coords[0])
+        b = tuple(line.coords[-1])
+        endpoints.append((a, b))
+        if a == b:
+            continue
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+
+    junctions = {pt for pt, deg in degree.items() if deg >= 3}
+    if not junctions:
+        return ml, 0, 0, 0, 0, 0
+
+    adjacency = {pt: set() for pt in junctions}
+    for line, (a, b) in zip(lines, endpoints):
+        if (
+            a != b
+            and a in junctions
+            and b in junctions
+            and line.length <= float(max_edge_m)
+        ):
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+
+    # First find the connected components of the short-junction graph.
+    raw_components = []
+    seen = set()
+    for node in junctions:
+        if node in seen or not adjacency[node]:
+            continue
+
+        stack = [node]
+        comp = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            comp.add(cur)
+            stack.extend(adjacency[cur] - seen)
+
+        if len(comp) >= 2:
+            raw_components.append(comp)
+
+    accepted = []
+    rejected_size = 0
+    rejected_shape = 0
+
+    for comp in raw_components:
+        # Hard node-count cap.
+        if len(comp) > int(max_cluster_nodes):
+            rejected_size += 1
+            continue
+
+        # Hard whole-cluster diameter cap, not just per-edge distance.
+        pts = list(comp)
+        diameter = 0.0
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                dx = pts[i][0] - pts[j][0]
+                dy = pts[i][1] - pts[j][1]
+                diameter = max(diameter, math.hypot(dx, dy))
+
+        if diameter > float(max_cluster_diameter_m):
+            rejected_shape += 1
+            continue
+
+        # Count external graph edges that would terminate at the new merged node.
+        # That is the prospective node valence after internal edges vanish.
+        external_edges = 0
+        for a, b in endpoints:
+            a_in = a in comp
+            b_in = b in comp
+            if a_in ^ b_in:
+                external_edges += 1
+
+        if external_edges > int(max_result_degree):
+            rejected_shape += 1
+            continue
+
+        accepted.append(comp)
+
+    if not accepted:
+        return ml, 0, 0, 0, rejected_size, rejected_shape
+
+    snap = {}
+    for comp in accepted:
+        rx = sum(p[0] for p in comp) / len(comp)
+        ry = sum(p[1] for p in comp) / len(comp)
+        rep = (rx, ry)
+        for p in comp:
+            snap[p] = rep
+
+    rebuilt = []
+    internal_removed = 0
+
+    for line, (a, b) in zip(lines, endpoints):
+        if a == b:
+            rebuilt.append(line)
+            continue
+
+        new_a = snap.get(a, a)
+        new_b = snap.get(b, b)
+
+        if new_a == new_b and (new_a != a or new_b != b):
+            internal_removed += 1
+            continue
+
+        coords = list(line.coords)
+        changed = False
+
+        if new_a != a:
+            coords[0] = new_a
+            changed = True
+        if new_b != b:
+            coords[-1] = new_b
+            changed = True
+
+        if changed:
+            clean = [coords[0]]
+            for xy in coords[1:]:
+                if tuple(xy) != tuple(clean[-1]):
+                    clean.append(xy)
+            if len(clean) >= 2:
+                rebuilt.append(geometry.LineString(clean))
+        else:
+            rebuilt.append(line)
+
+    result = geometry.MultiLineString(rebuilt)
+    return (
+        result,
+        len(accepted),
+        len(snap),
+        internal_removed,
+        rejected_size,
+        rejected_shape,
+    )
+
+
+def _prune_tiny_tangle_faces(multilines, max_area_m2=5000.0,
+                              max_perimeter_m=360.0,
+                              max_compactness=0.42,
+                              min_junction_vertices=2):
+    """
+    Remove edges belonging to tiny, angular graph faces ("spaghetti" tangles).
+
+    A candidate must simultaneously be:
+      * small in area,
+      * short in perimeter,
+      * non-compact/angular, and
+      * tied into the graph at >= min_junction_vertices vertices.
+
+    Smooth isolated rings therefore survive.  Only edges whose midpoint lies
+    on a qualifying polygonized face boundary are removed.
+    """
+    ml = _to_multilinestring(multilines)
+    lines = [g for g in ml.geoms if not g.is_empty and len(g.coords) >= 2]
+    if not lines:
+        return ml, 0, 0
+
+    # Degree map on the already noded graph.
+    degree = {}
+    for line in lines:
+        a, b = tuple(line.coords[0]), tuple(line.coords[-1])
+        if a != b:
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+
+    faces = list(ops.polygonize(ml))
+    bad_boundaries = []
+    bad_faces = 0
+    import math
+
+    for face in faces:
+        area = float(face.area)
+        perim = float(face.length)
+        if area <= 0.0 or perim <= 0.0:
+            continue
+        compactness = (4.0 * math.pi * area) / (perim * perim)
+
+        # Count graph junctions occurring on this face boundary.
+        junctions = 0
+        seen = set()
+        rings = [face.exterior] + list(face.interiors)
+        for ring in rings:
+            for xy in ring.coords:
+                pt = tuple(xy)
+                if pt not in seen and degree.get(pt, 0) >= 3:
+                    seen.add(pt)
+                    junctions += 1
+
+        if (area <= float(max_area_m2)
+                and perim <= float(max_perimeter_m)
+                and compactness <= float(max_compactness)
+                and junctions >= int(min_junction_vertices)):
+            bad_boundaries.append(face.boundary)
+            bad_faces += 1
+
+    if not bad_boundaries:
+        return ml, 0, 0
+
+    bad = ops.unary_union(bad_boundaries)
+    kept = []
+    removed = 0
+
+    # Remove only graph segments actually carried by a bad face boundary.
+    # representative midpoint test avoids deleting neighboring long chains
+    # that merely touch the face at a junction.
+    for line in lines:
+        mid = line.interpolate(0.5, normalized=True)
+        if bad.distance(mid) <= 0.01:
+            removed += 1
+        else:
+            kept.append(line)
+
+    return geometry.MultiLineString(kept), bad_faces, removed
+
+
+def _prune_short_dangling_edges(multilines, max_length_m=45.0):
+    """
+    Remove only short degree-1 dangling edges from the shared boundary graph.
+
+    This is deliberately conservative.  Closed rings and edges joining two
+    graph nodes are preserved, even when short, because they can represent a
+    genuine small landcover face.  The target is the little one-ended spikes
+    visible in the debug graph, not wholesale topology simplification.
+    """
+    ml = _to_multilinestring(multilines)
+    lines = [g for g in ml.geoms if not g.is_empty and len(g.coords) >= 2]
+    if not lines:
+        return ml, 0
+
+    degree = {}
+    for line in lines:
+        a = tuple(line.coords[0])
+        b = tuple(line.coords[-1])
+        if a == b:
+            continue
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+
+    kept = []
+    removed = 0
+    for line in lines:
+        a = tuple(line.coords[0])
+        b = tuple(line.coords[-1])
+
+        # Never prune closed boundaries.
+        if a == b:
+            kept.append(line)
+            continue
+
+        dangling = (degree.get(a, 0) == 1) ^ (degree.get(b, 0) == 1)
+        if dangling and line.length <= float(max_length_m):
+            removed += 1
+            continue
+
+        kept.append(line)
+
+    return geometry.MultiLineString(kept), removed
+
+
+def _generalize_shared_lines(multilines, simplify_m, smooth_iterations,
+                             smooth_offset, smooth_max_angle):
+    """
+    Generalize each maximal edge-chain of the shared boundary graph.
+
+    Junction endpoints are pinned. Open chains normally use the requested
+    simplification tolerance, but a curved chain that would collapse to only
+    2-3 coordinates is locally retried at a finer tolerance so Chaikin retains
+    enough support points to round the boundary rather than preserve a chord.
+    """
+    out = []
+    guarded_count = 0
+
+    for line in _to_multilinestring(multilines).geoms:
+        if line.is_empty or len(line.coords) < 2:
+            continue
+
+        start, end = tuple(line.coords[0]), tuple(line.coords[-1])
+        closed = start == end
+        work = line
+
+        if simplify_m:
+            if closed:
+                work = work.simplify(
+                    float(simplify_m),
+                    preserve_topology=True,
+                )
+            else:
+                work, guarded = _simplify_open_chain_guarded(
+                    work,
+                    simplify_m,
+                )
+                if guarded:
+                    guarded_count += 1
+
+        if closed:
+            coords = list(work.coords)
+            for _ in range(max(0, int(smooth_iterations))):
+                coords = _chaikin_ring(
+                    coords,
+                    smooth_offset,
+                    smooth_max_angle,
+                )
+            if len(coords) >= 4:
+                work = geometry.LineString(coords)
+        else:
+            for _ in range(max(0, int(smooth_iterations))):
+                work = _chaikin_open_line_once(
+                    work,
+                    smooth_offset,
+                    smooth_max_angle,
+                )
+
+            # Graph nodes remain bit-for-bit identical after every operation.
+            coords = list(work.coords)
+            if len(coords) >= 2:
+                coords[0], coords[-1] = start, end
+                work = geometry.LineString(coords)
+
+        if not work.is_empty and len(work.coords) >= 2:
+            out.append(work)
+
+    UI.vprint(
+        1,
+        "   Junction-chain guard applied to:",
+        guarded_count,
+        "curved sparse chains",
+    )
+
+    return geometry.MultiLineString(out)
+
+
+def _build_shared_boundary_graph(class_polys, simplify_m, smooth_iterations,
+                                 smooth_offset, smooth_max_angle):
+    """
+    Build one topology-preserving ecological boundary graph.
+
+    Pipeline:
+        class boundaries
+        -> unary union / noding / deduplication
+        -> remove town edges from the natural graph
+        -> line-merge degree-2 fragments into maximal chains
+        -> simplify + smooth each chain with endpoints pinned
+        -> add town edges back unchanged
+
+    The line-merge step is critical: without it, noding creates huge numbers of
+    tiny raster-scale segments that Douglas-Peucker cannot meaningfully simplify.
+    """
+    raw_lines, town_lines = [], []
+
+    for layer_name, pol in class_polys:
+        if pol is None or pol.is_empty:
+            continue
+
+        boundary = _to_multilinestring(pol.boundary)
+        raw_lines.extend(boundary.geoms)
+
+        if layer_name == "town":
+            town_lines.extend(boundary.geoms)
+
+    if not raw_lines:
+        empty = geometry.MultiLineString()
+        return empty, empty, empty, empty, empty
+
+    # One shared copy of every semantic interface; intersections are noded here.
+    raw_shared = _to_multilinestring(ops.unary_union(raw_lines))
+
+    town_fixed = (
+        _to_multilinestring(ops.unary_union(town_lines))
+        if town_lines else geometry.MultiLineString()
+    )
+
+    # Keep the deliberately authored town boundary untouched.
+    natural_raw = (
+        _to_multilinestring(raw_shared.difference(town_fixed))
+        if not town_fixed.is_empty else raw_shared
+    )
+
+    # Reassemble noded fragments into maximal chains between true junctions.
+    merged_chains = _linemerge_multilines(natural_raw)
+
+    (
+        merged_chains,
+        junction_clusters,
+        junction_nodes,
+        junction_internal,
+        junction_rejected_size,
+        junction_rejected_shape,
+    ) = _collapse_connected_junction_clusters(
+        merged_chains,
+        max_edge_m=75.0,
+        max_cluster_diameter_m=75.0,
+        max_cluster_nodes=4,
+        max_result_degree=5,
+    )
+    UI.vprint(
+        1,
+        "   Junction micro-clusters collapsed:",
+        junction_clusters,
+        "clusters /",
+        junction_nodes,
+        "junction nodes /",
+        junction_internal,
+        "internal edges removed",
+    )
+    UI.vprint(
+        1,
+        "   Junction clusters rejected:",
+        junction_rejected_size,
+        "oversize /",
+        junction_rejected_shape,
+        "diameter-or-valence",
+        "(limits: <=4 nodes, <=75 m diameter, <=5 external edges)",
+    )
+
+    # Collapse can create new degree-2 continuity. Reassemble before any
+    # subsequent cleanup and before the 30 m guarded generalization.
+    merged_chains = _linemerge_multilines(merged_chains)
+
+    merged_chains, tangle_faces, tangle_edges = _prune_tiny_tangle_faces(
+        merged_chains,
+        max_area_m2=5000.0,
+        max_perimeter_m=360.0,
+        max_compactness=0.42,
+        min_junction_vertices=2,
+    )
+    UI.vprint(
+        1,
+        "   Tiny tangle faces pruned:",
+        tangle_faces,
+        "faces /",
+        tangle_edges,
+        "graph edges",
+    )
+
+    # Re-merge after deleting tangle edges so newly degree-2 boundaries become
+    # useful maximal chains before guarded simplification and Chaikin.
+    merged_chains = _linemerge_multilines(merged_chains)
+
+    merged_chains, pruned_spurs = _prune_short_dangling_edges(merged_chains, 45.0)
+    UI.vprint(1, "   Short dangling graph edges pruned:", pruned_spurs, "(<= 45 m)")
+    generalized_natural = _generalize_shared_lines(
+        merged_chains,
+        simplify_m,
+        smooth_iterations,
+        smooth_offset,
+        smooth_max_angle,
+    )
+
+    final_parts = list(generalized_natural.geoms) + list(town_fixed.geoms)
+    final_shared = (
+        _to_multilinestring(ops.unary_union(final_parts))
+        if final_parts else geometry.MultiLineString()
+    )
+
+    return raw_shared, merged_chains, generalized_natural, town_fixed, final_shared
+
+
+def _write_debug_line_gpkg(path, layers, src_srs):
+    """Write shared-boundary stages as line layers for QGIS inspection."""
+    driver = ogr.GetDriverByName("GPKG")
+    if os.path.exists(path):
+        driver.DeleteDataSource(path)
+    ds = driver.CreateDataSource(path)
+    if ds is None:
+        raise RuntimeError("could not create debug GeoPackage")
+
+    for layer_name, geom_value in layers:
+        layer = ds.CreateLayer(
+            layer_name, srs=src_srs, geom_type=ogr.wkbMultiLineString
+        )
+        feat = ogr.Feature(layer.GetLayerDefn())
+        feat.SetGeometry(ogr.CreateGeometryFromWkb(
+            wkb.dumps(_to_multilinestring(geom_value), hex=False)
+        ))
+        layer.CreateFeature(feat)
+        feat = None
+        layer = None
+    ds = None
+
+
+def _vertex_count(geom):
+    if geom is None or geom.is_empty:
+        return 0
+    if isinstance(geom, geometry.Polygon):
+        return len(geom.exterior.coords) + sum(
+            len(ring.coords) for ring in geom.interiors
+        )
+    if isinstance(geom, geometry.MultiPolygon):
+        return sum(_vertex_count(g) for g in geom.geoms)
+    if isinstance(geom, geometry.LineString):
+        return len(geom.coords)
+    if isinstance(geom, geometry.MultiLineString):
+        return sum(len(g.coords) for g in geom.geoms)
+    if isinstance(geom, geometry.GeometryCollection):
+        return sum(_vertex_count(g) for g in geom.geoms)
+    return 0
+
+
+def _write_debug_gpkg(path, processed_classes, src_srs):
+    """Optional QGIS inspection output: one smoothed polygon layer per class."""
+    driver = ogr.GetDriverByName("GPKG")
+    if driver is None:
+        raise RuntimeError("OGR GPKG driver unavailable")
+
+    if os.path.exists(path):
+        driver.DeleteDataSource(path)
+
+    ds = driver.CreateDataSource(path)
+    if ds is None:
+        raise RuntimeError("could not create debug GeoPackage")
+
+    for layer_name, geom_value in processed_classes:
+        layer = ds.CreateLayer(
+            layer_name,
+            srs=src_srs,
+            geom_type=ogr.wkbMultiPolygon,
+        )
+        feat = ogr.Feature(layer.GetLayerDefn())
+        ogr_geom = ogr.CreateGeometryFromWkb(wkb.dumps(geom_value, hex=False))
+        feat.SetGeometry(ogr_geom)
+        layer.CreateFeature(feat)
+        feat = None
+        layer = None
+
+    ds = None
+
+
+def _prepare_cache(gpkg_path):
+    cache_dir = _cache_dir(gpkg_path)
+    meta_path = os.path.join(cache_dir, CACHE_META)
+    wanted = _source_signature(gpkg_path)
+    force = os.environ.get("ULLAAQ_REBUILD_LANDCOVER_CACHE", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+    current = _read_json(meta_path)
+    valid = (current == wanted) and not force
+
+    if not valid:
+        if os.path.isdir(cache_dir):
+            UI.vprint(1, "   Ullaaq cache is stale or rebuild requested; clearing:", cache_dir)
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        _atomic_write_json(meta_path, wanted)
+    else:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    return cache_dir, valid
+
+
+def _load_or_dissolve_layer(layer, layer_name, cache_dir):
+    cache_path = os.path.join(cache_dir, "dissolved_" + layer_name + ".wkb")
+
+    if os.path.isfile(cache_path):
+        try:
+            geom = _load_geom(cache_path)
+            if geom is not None and not geom.is_empty:
+                UI.vprint(1, "   ", layer_name, ": loaded dissolved cache")
+                return geom
+        except Exception as e:
+            UI.vprint(1, "   WARNING: could not read", layer_name, "cache:", repr(e))
+
+    polys = []
+    for feat in layer:
+        sg = _ogr_to_shapely(feat.GetGeometryRef())
+        if sg is None or sg.is_empty:
+            continue
+        if not sg.is_valid:
+            sg = sg.buffer(0)
+        if sg.is_empty:
+            continue
+        polys.append(sg)
+
+    if not polys:
+        UI.vprint(1, "   ", layer_name, ": no polygons")
+        return None
+
+    UI.vprint(1, "   ", layer_name, ": dissolving", len(polys), "polygons")
+    dissolved = ops.unary_union(polys)
+    if dissolved is None or dissolved.is_empty:
+        UI.vprint(1, "   WARNING:", layer_name, "dissolve produced no geometry")
+        return None
+
+    try:
+        _save_geom(cache_path, dissolved)
+        UI.vprint(1, "   ", layer_name, ": saved dissolved cache")
+    except Exception as e:
+        UI.vprint(1, "   WARNING: could not save", layer_name, "cache:", repr(e))
+
+    return dissolved
+
+
+def _load_or_build_boundaries(
+    class_polys, simplify_m, smooth_iterations, smooth_offset,
+    smooth_max_angle, cache_dir, src_srs=None,
+):
+    key = _geometry_key(
+        simplify_m, smooth_iterations, smooth_offset, smooth_max_angle
+    )
+    cache_path = os.path.join(cache_dir, "boundaries_" + key + ".wkb")
+
+    if os.path.isfile(cache_path):
+        try:
+            merged = _to_multilinestring(_load_geom(cache_path))
+            if not merged.is_empty:
+                UI.vprint(1, "   Loaded Ullaaq shared-boundary cache:", cache_path)
+                return merged
+        except Exception as e:
+            UI.vprint(1, "   WARNING: could not read boundary cache:", repr(e))
+
+    UI.vprint(1, "   Building shared/noded landcover boundary graph")
+    raw_shared, merged_chains, generalized_natural, town_fixed, merged = \
+        _build_shared_boundary_graph(
+            class_polys, simplify_m, smooth_iterations,
+            smooth_offset, smooth_max_angle
+        )
+
+    UI.vprint(
+        1,
+        "   Shared boundary lines:",
+        len(raw_shared.geoms),
+        "->",
+        len(merged_chains.geoms),
+        "(noded fragments -> merged chains)",
+    )
+    UI.vprint(
+        1,
+        "   Shared boundary vertices:",
+        _vertex_count(raw_shared),
+        "->",
+        _vertex_count(merged_chains),
+        "->",
+        _vertex_count(generalized_natural),
+        "(raw shared -> merged chains -> generalized natural; town added unchanged)",
+    )
+
+    debug_path = os.environ.get("ULLAAQ_DEBUG_GPKG", "").strip()
+    if debug_path and src_srs is not None:
+        try:
+            debug_path = os.path.expanduser(debug_path)
+            _write_debug_line_gpkg(
+                debug_path,
+                [
+                    ("raw_shared", raw_shared),
+                    ("merged_chains", merged_chains),
+                    ("generalized_natural", generalized_natural),
+                    ("town_fixed", town_fixed),
+                    ("final_shared", merged),
+                ],
+                src_srs,
+            )
+            UI.vprint(1, "   Wrote Ullaaq shared-edge debug GeoPackage:", debug_path)
+        except Exception as e:
+            UI.vprint(1, "   WARNING: could not write debug GeoPackage:", repr(e))
+
+    if merged.is_empty:
+        return geometry.MultiLineString()
+
+    UI.vprint(1, "   Final shared boundary lines:", len(merged.geoms))
+    try:
+        _save_geom(cache_path, merged)
+        UI.vprint(1, "   Saved Ullaaq shared-boundary cache:", cache_path)
+    except Exception as e:
+        UI.vprint(1, "   WARNING: could not save boundary cache:", repr(e))
+    return merged
+
+
+def include_landcover_boundaries(
+    vector_map,
+    tile,
+    gpkg_path=None,
+    simplify_m=DEFAULT_SIMPLIFY_M,
+    smooth_iterations=DEFAULT_SMOOTH_ITERATIONS,
+    smooth_offset=DEFAULT_SMOOTH_OFFSET,
+    smooth_max_angle=DEFAULT_SMOOTH_MAX_ANGLE,
+):
+    gpkg_path = gpkg_path or os.environ.get(
+        "ULLAAQ_LANDCOVER_GPKG",
+        DEFAULT_GPKG,
+    )
+    gpkg_path = os.path.expanduser(gpkg_path)
+
+    if not os.path.isfile(gpkg_path):
+        UI.vprint(
+            1,
+            "   WARNING: Ullaaq landcover GeoPackage not found:",
+            gpkg_path,
+        )
+        return 0
+
+    UI.vprint(0, "-> Inserting Ullaaq landcover boundaries")
+    UI.vprint(1, "   Source:", gpkg_path)
+    UI.vprint(1, "   Simplification:", simplify_m, "m")
+    UI.vprint(
+        1,
+        "   Smoothing:",
+        smooth_iterations,
+        "iterations, offset",
+        smooth_offset,
+        "max angle",
+        smooth_max_angle,
+    )
+
+    try:
+        cache_dir, cache_was_valid = _prepare_cache(gpkg_path)
+    except Exception as e:
+        UI.vprint(1, "   WARNING: Ullaaq cache disabled:", repr(e))
+        cache_dir = None
+        cache_was_valid = False
+
+    if cache_dir:
+        UI.vprint(1, "   Cache:", cache_dir)
+        UI.vprint(1, "   Cache status:", "warm" if cache_was_valid else "cold")
+
+    ds = ogr.Open(gpkg_path, 0)
+    if ds is None:
+        UI.vprint(1, "   WARNING: cannot open Ullaaq landcover GeoPackage")
+        return 0
+
+    src_srs = None
+    class_polys = []
+
+    for layer_name in LANDCOVER_LAYERS:
+        layer = ds.GetLayerByName(layer_name)
+        if layer is None:
+            UI.vprint(1, "   WARNING: missing landcover layer:", layer_name)
+            continue
+
+        if src_srs is None:
+            layer_srs = layer.GetSpatialRef()
+            if layer_srs is None:
+                UI.vprint(1, "   WARNING: landcover layer has no spatial reference")
+                ds = None
+                return 0
+            src_srs = layer_srs.Clone()
+            src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+        if cache_dir:
+            dissolved = _load_or_dissolve_layer(layer, layer_name, cache_dir)
+        else:
+            # Cache failure fallback: preserve the old behavior.
+            polys = []
+            for feat in layer:
+                sg = _ogr_to_shapely(feat.GetGeometryRef())
+                if sg is None or sg.is_empty:
+                    continue
+                if not sg.is_valid:
+                    sg = sg.buffer(0)
+                if not sg.is_empty:
+                    polys.append(sg)
+            if not polys:
+                dissolved = None
+            else:
+                UI.vprint(1, "   ", layer_name, ": dissolving", len(polys), "polygons")
+                dissolved = ops.unary_union(polys)
+
+        if dissolved is not None and not dissolved.is_empty:
+            class_polys.append((layer_name, dissolved))
+
+    if not class_polys or src_srs is None:
+        UI.vprint(1, "   WARNING: no usable Ullaaq landcover geometry")
+        ds = None
+        return 0
+
+    if cache_dir:
+        merged = _load_or_build_boundaries(
+            class_polys,
+            simplify_m,
+            smooth_iterations,
+            smooth_offset,
+            smooth_max_angle,
+            cache_dir,
+            src_srs=src_srs,
+        )
+    else:
+        _raw, _chains, _natural, _town, merged = _build_shared_boundary_graph(
+            class_polys, simplify_m, smooth_iterations,
+            smooth_offset, smooth_max_angle
+        )
+
+    if merged.is_empty:
+        UI.vprint(1, "   WARNING: no Ullaaq landcover boundaries produced")
+        ds = None
+        return 0
+
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    to_wgs84 = osr.CoordinateTransformation(src_srs, wgs84)
+
+    tile_lines = _transform_lines_to_tile_relative(
+        merged,
+        to_wgs84,
+        tile,
+    )
+
+    if tile_lines.is_empty:
+        UI.vprint(1, "   WARNING: transformed Ullaaq boundaries are empty")
+        ds = None
+        return 0
+
+    before = len(vector_map.dico_edges)
+
+    vector_map.encode_MultiLineString(
+        tile_lines,
+        tile.dem.alt_vec,
+        "DUMMY",
+        check=True,
+        refine=False,
+        skip_cut=False,
+    )
+
+    after = len(vector_map.dico_edges)
+
+    UI.vprint(
+        1,
+        "   Ullaaq landcover boundary lines:",
+        len(tile_lines.geoms),
+    )
+    UI.vprint(
+        1,
+        "   Constrained edges added:",
+        after - before,
+    )
+
+    ds = None
+    return 1
