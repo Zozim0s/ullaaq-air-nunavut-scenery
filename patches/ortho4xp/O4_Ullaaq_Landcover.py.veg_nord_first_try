@@ -33,6 +33,7 @@ import tempfile
 import numpy
 from osgeo import ogr, osr
 from shapely import geometry, ops, wkb
+from shapely.strtree import STRtree
 
 import O4_UI_Utils as UI
 
@@ -66,7 +67,7 @@ NATURAL_LAYERS = {
 # Douglas-Peucker simplification at 30 m with sparse-chain guarding, followed by two Chaikin smoothing
 # iterations with offset 0.25. 180 degrees means smooth every eligible node.
 DEFAULT_SIMPLIFY_M = 30.0
-DEFAULT_SMOOTH_ITERATIONS = 2
+DEFAULT_SMOOTH_ITERATIONS = 0
 DEFAULT_SMOOTH_OFFSET = 0.25
 DEFAULT_SMOOTH_MAX_ANGLE = 180.0
 
@@ -1137,6 +1138,219 @@ def _load_or_dissolve_layer(layer, layer_name, cache_dir):
     return dissolved
 
 
+
+def _diagnose_generalization_conflicts(
+    original_multilines, generalized_multilines, allowed_contact_m=0.5,
+):
+    """
+    Diagnose topology changes introduced by per-chain generalization.
+
+    A generalized chain is flagged when it becomes self-intersecting even though
+    its source chain was simple, or when it intersects another generalized chain
+    somewhere that the corresponding source chains did not intersect.
+
+    This is diagnostic only: it does not alter any geometry used for insertion.
+    """
+    originals = [
+        g for g in _to_multilinestring(original_multilines).geoms
+        if not g.is_empty and len(g.coords) >= 2
+    ]
+    generalized = [
+        g for g in _to_multilinestring(generalized_multilines).geoms
+        if not g.is_empty and len(g.coords) >= 2
+    ]
+
+    self_conflict_idx = set()
+    network_conflict_idx = set()
+    conflict_pairs = 0
+
+    if len(originals) != len(generalized):
+        UI.vprint(
+            1,
+            "   WARNING: generalization diagnostic skipped network-pair audit;",
+            "source/generalized chain counts differ:",
+            len(originals),
+            "!=",
+            len(generalized),
+        )
+        # Self-intersection testing does not depend on one-to-one correspondence.
+        for i, line in enumerate(generalized):
+            if not line.is_simple:
+                self_conflict_idx.add(i)
+        return (
+            geometry.MultiLineString([generalized[i] for i in sorted(self_conflict_idx)]),
+            geometry.MultiLineString(),
+            len(self_conflict_idx),
+            0,
+            0,
+        )
+
+    for i, (source, candidate) in enumerate(zip(originals, generalized)):
+        if source.is_simple and not candidate.is_simple:
+            self_conflict_idx.add(i)
+
+    if generalized:
+        tree = STRtree(generalized)
+        contact_tol = float(allowed_contact_m)
+
+        for i, candidate in enumerate(generalized):
+            for value in tree.query(candidate, predicate="intersects"):
+                j = int(value)
+                if j <= i:
+                    continue
+
+                candidate_j = generalized[j]
+                new_contact = candidate.intersection(candidate_j)
+                if new_contact.is_empty:
+                    continue
+
+                old_contact = originals[i].intersection(originals[j])
+                if old_contact.is_empty:
+                    introduced = True
+                else:
+                    # Endpoints are pinned, so legitimate source contacts should
+                    # remain at the original graph junction.  Permit only a tiny
+                    # numeric neighborhood around that pre-existing contact.
+                    allowed = old_contact.buffer(contact_tol)
+                    introduced = not new_contact.difference(allowed).is_empty
+
+                if introduced:
+                    conflict_pairs += 1
+                    network_conflict_idx.add(i)
+                    network_conflict_idx.add(j)
+
+    return (
+        geometry.MultiLineString([generalized[i] for i in sorted(self_conflict_idx)]),
+        geometry.MultiLineString([generalized[i] for i in sorted(network_conflict_idx)]),
+        len(self_conflict_idx),
+        len(network_conflict_idx),
+        conflict_pairs,
+    )
+
+
+def _diagnose_generalization_shape(
+    original_multilines, generalized_multilines, outlier_fraction=0.01,
+):
+    """
+    Measure shape distortion introduced by per-chain generalization.
+
+    This is diagnostic only.  It compares each generalized chain with its
+    corresponding merged source chain and reports distributions for:
+
+      * absolute Hausdorff displacement in source-CRS metres,
+      * Hausdorff displacement normalized by source-chain length, and
+      * retained length (generalized length / source length).
+
+    Three debug layers contain the worst outlier_fraction of candidates by
+    absolute Hausdorff displacement, relative Hausdorff displacement, and
+    absolute length-ratio change respectively.
+    """
+    originals = [
+        g for g in _to_multilinestring(original_multilines).geoms
+        if not g.is_empty and len(g.coords) >= 2
+    ]
+    generalized = [
+        g for g in _to_multilinestring(generalized_multilines).geoms
+        if not g.is_empty and len(g.coords) >= 2
+    ]
+
+    empty = geometry.MultiLineString()
+    if len(originals) != len(generalized) or not originals:
+        UI.vprint(
+            1,
+            "   WARNING: shape diagnostic skipped; source/generalized chain counts differ or are empty:",
+            len(originals),
+            "!=",
+            len(generalized),
+        )
+        return empty, empty, empty
+
+    hausdorff = []
+    rel_hausdorff = []
+    length_ratio = []
+    length_change = []
+
+    for source, candidate in zip(originals, generalized):
+        source_len = float(source.length)
+        candidate_len = float(candidate.length)
+        hd = float(source.hausdorff_distance(candidate))
+        ratio = candidate_len / source_len if source_len > 0.0 else 1.0
+
+        hausdorff.append(hd)
+        rel_hausdorff.append(hd / max(source_len, 1.0))
+        length_ratio.append(ratio)
+        length_change.append(abs(ratio - 1.0))
+
+    h = numpy.asarray(hausdorff, dtype=float)
+    rh = numpy.asarray(rel_hausdorff, dtype=float)
+    lr = numpy.asarray(length_ratio, dtype=float)
+    lc = numpy.asarray(length_change, dtype=float)
+
+    def pct(arr, q):
+        return float(numpy.percentile(arr, q))
+
+    UI.vprint(
+        1,
+        "   Shape diagnostic Hausdorff m (p50/p90/p95/p99/max):",
+        "{:.2f}".format(pct(h, 50)),
+        "{:.2f}".format(pct(h, 90)),
+        "{:.2f}".format(pct(h, 95)),
+        "{:.2f}".format(pct(h, 99)),
+        "{:.2f}".format(float(h.max())),
+    )
+    UI.vprint(
+        1,
+        "   Shape diagnostic relative Hausdorff (p50/p90/p95/p99/max):",
+        "{:.4f}".format(pct(rh, 50)),
+        "{:.4f}".format(pct(rh, 90)),
+        "{:.4f}".format(pct(rh, 95)),
+        "{:.4f}".format(pct(rh, 99)),
+        "{:.4f}".format(float(rh.max())),
+    )
+    UI.vprint(
+        1,
+        "   Shape diagnostic retained length ratio (p01/p05/p50/p95/p99):",
+        "{:.4f}".format(pct(lr, 1)),
+        "{:.4f}".format(pct(lr, 5)),
+        "{:.4f}".format(pct(lr, 50)),
+        "{:.4f}".format(pct(lr, 95)),
+        "{:.4f}".format(pct(lr, 99)),
+    )
+
+    fraction = min(0.25, max(0.0001, float(outlier_fraction)))
+    q = 100.0 * (1.0 - fraction)
+    h_cut = pct(h, q)
+    rh_cut = pct(rh, q)
+    lc_cut = pct(lc, q)
+
+    abs_idx = [i for i, value in enumerate(h) if value >= h_cut and value > 0.0]
+    rel_idx = [i for i, value in enumerate(rh) if value >= rh_cut and value > 0.0]
+    len_idx = [i for i, value in enumerate(lc) if value >= lc_cut and value > 0.0]
+
+    UI.vprint(
+        1,
+        "   Shape diagnostic top {:.2f}% cutoffs: Hausdorff >= {:.2f} m / relative >= {:.4f} / |length ratio-1| >= {:.4f}".format(
+            100.0 * fraction, h_cut, rh_cut, lc_cut
+        ),
+    )
+    UI.vprint(
+        1,
+        "   Shape diagnostic outlier chains:",
+        len(abs_idx),
+        "absolute-Hausdorff /",
+        len(rel_idx),
+        "relative-Hausdorff /",
+        len(len_idx),
+        "length-change",
+    )
+
+    return (
+        geometry.MultiLineString([generalized[i] for i in abs_idx]),
+        geometry.MultiLineString([generalized[i] for i in rel_idx]),
+        geometry.MultiLineString([generalized[i] for i in len_idx]),
+    )
+
+
 def _load_or_build_boundaries(
     class_polys, simplify_m, smooth_iterations, smooth_offset,
     smooth_max_angle, cache_dir, src_srs=None,
@@ -1145,8 +1359,14 @@ def _load_or_build_boundaries(
         simplify_m, smooth_iterations, smooth_offset, smooth_max_angle
     )
     cache_path = os.path.join(cache_dir, "boundaries_" + key + ".wkb")
+    diag_requested = os.environ.get(
+        "ULLAAQ_DIAG_GENERALIZATION", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
 
-    if os.path.isfile(cache_path):
+    # Diagnostic mode deliberately rebuilds only the boundary stage so the
+    # dissolved class caches remain warm while we can inspect merged_chains
+    # versus generalized_natural.
+    if os.path.isfile(cache_path) and not diag_requested:
         try:
             merged = _to_multilinestring(_load_geom(cache_path))
             if not merged.is_empty:
@@ -1181,19 +1401,64 @@ def _load_or_build_boundaries(
         "(raw shared -> merged chains -> generalized natural; town added unchanged)",
     )
 
+    diag_self = geometry.MultiLineString()
+    diag_network = geometry.MultiLineString()
+    diag_hausdorff_abs = geometry.MultiLineString()
+    diag_hausdorff_rel = geometry.MultiLineString()
+    diag_length_change = geometry.MultiLineString()
+    if diag_requested:
+        UI.vprint(1, "   Running generalization topology diagnostics")
+        (
+            diag_self,
+            diag_network,
+            diag_self_count,
+            diag_network_count,
+            diag_pair_count,
+        ) = _diagnose_generalization_conflicts(
+            merged_chains, generalized_natural, allowed_contact_m=0.5
+        )
+        UI.vprint(
+            1,
+            "   Generalization diagnostic conflicts:",
+            diag_self_count,
+            "new self-intersecting chains /",
+            diag_network_count,
+            "chains in",
+            diag_pair_count,
+            "new network-intersection pairs",
+        )
+
+        UI.vprint(1, "   Running generalization shape diagnostics")
+        (
+            diag_hausdorff_abs,
+            diag_hausdorff_rel,
+            diag_length_change,
+        ) = _diagnose_generalization_shape(
+            merged_chains, generalized_natural, outlier_fraction=0.01
+        )
+
     debug_path = os.environ.get("ULLAAQ_DEBUG_GPKG", "").strip()
     if debug_path and src_srs is not None:
         try:
             debug_path = os.path.expanduser(debug_path)
+            debug_layers = [
+                ("raw_shared", raw_shared),
+                ("merged_chains", merged_chains),
+                ("generalized_natural", generalized_natural),
+                ("town_fixed", town_fixed),
+                ("final_shared", merged),
+            ]
+            if diag_requested:
+                debug_layers.extend([
+                    ("generalization_self_conflicts", diag_self),
+                    ("generalization_network_conflicts", diag_network),
+                    ("generalization_hausdorff_abs_p99", diag_hausdorff_abs),
+                    ("generalization_hausdorff_rel_p99", diag_hausdorff_rel),
+                    ("generalization_length_change_p99", diag_length_change),
+                ])
             _write_debug_line_gpkg(
                 debug_path,
-                [
-                    ("raw_shared", raw_shared),
-                    ("merged_chains", merged_chains),
-                    ("generalized_natural", generalized_natural),
-                    ("town_fixed", town_fixed),
-                    ("final_shared", merged),
-                ],
+                debug_layers,
                 src_srs,
             )
             UI.vprint(1, "   Wrote Ullaaq shared-edge debug GeoPackage:", debug_path)
@@ -1210,6 +1475,198 @@ def _load_or_build_boundaries(
     except Exception as e:
         UI.vprint(1, "   WARNING: could not save boundary cache:", repr(e))
     return merged
+
+
+
+def _load_vegnord_boundaries(ds, layer_name="veg_nord"):
+    """
+    Read VEG_NORD polygons and build one shared terrestrial boundary network.
+
+    VEG_NORD is already professionally generalized vector data.  This path
+    deliberately does not dissolve classes, simplify, smooth, or otherwise move
+    source coordinates.  It only extracts polygon boundaries and unary-unions
+    the linework so coincident shared edges are deduplicated and intersections
+    are noded.
+
+    EAU polygons are excluded here because water is expected to have already
+    been inserted into Vector_Map through the Ullaaq water authority path.
+    Shoreline copies contributed by adjacent terrestrial polygons are removed
+    later by _protect_hydro_constraints().
+    """
+    layer = ds.GetLayerByName(layer_name)
+    if layer is None:
+        return None, geometry.MultiLineString(), 0, 0, 0
+
+    layer_srs = layer.GetSpatialRef()
+    if layer_srs is None:
+        raise RuntimeError("VEG_NORD layer has no spatial reference")
+
+    src_srs = layer_srs.Clone()
+    src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    field_defn = layer.GetLayerDefn()
+    if field_defn.GetFieldIndex("co_ter") < 0:
+        raise RuntimeError("VEG_NORD layer is missing required field co_ter")
+
+    lines = []
+    source_count = 0
+    water_skipped = 0
+    empty_skipped = 0
+
+    layer.ResetReading()
+    for feat in layer:
+        source_count += 1
+
+        co_ter = (feat.GetField("co_ter") or "").strip()
+        if co_ter == "EAU":
+            water_skipped += 1
+            continue
+
+        sg = _ogr_to_shapely(feat.GetGeometryRef())
+        if sg is None or sg.is_empty:
+            empty_skipped += 1
+            continue
+
+        boundary = _to_multilinestring(sg.boundary)
+        if not boundary.is_empty:
+            lines.extend(boundary.geoms)
+
+    if not lines:
+        return src_srs, geometry.MultiLineString(), source_count, water_skipped, empty_skipped
+
+    # This is topology assembly only: it may split/node/deduplicate linework,
+    # but it does not generalize or move the source VEG_NORD coordinates.
+    shared = _to_multilinestring(ops.unary_union(lines))
+
+    UI.vprint(
+        1,
+        "   VEG_NORD noded boundary fragments:",
+        len(shared.geoms),
+    )
+    UI.vprint(
+        1,
+        "   VEG_NORD noded boundary vertices:",
+        _vertex_count(shared),
+    )
+
+    # Reassemble degree-2 fragments into maximal chains. This changes only
+    # the representation of the network, never the source coordinates.
+    shared = _linemerge_multilines(shared)
+
+    UI.vprint(
+        1,
+        "   VEG_NORD merged source chains:",
+        len(shared.geoms),
+    )
+    UI.vprint(
+        1,
+        "   VEG_NORD merged source vertices:",
+        _vertex_count(shared),
+    )
+
+    return src_srs, shared, source_count, water_skipped, empty_skipped
+
+
+def _include_vegnord_boundaries(vector_map, tile, ds, gpkg_path):
+    """Insert raw VEG_NORD terrestrial boundaries as DUMMY constraints."""
+    UI.vprint(0, "-> Inserting Ullaaq VEG_NORD boundaries")
+    UI.vprint(1, "   Source:", gpkg_path)
+    UI.vprint(
+        1,
+        "   Geometry policy: preserve source coordinates; no class dissolve, simplification, or smoothing",
+    )
+
+    try:
+        (
+            src_srs,
+            shared,
+            source_count,
+            water_skipped,
+            empty_skipped,
+        ) = _load_vegnord_boundaries(ds)
+    except Exception as e:
+        UI.vprint(1, "   WARNING: could not prepare VEG_NORD boundaries:", repr(e))
+        return 0
+
+    UI.vprint(1, "   VEG_NORD source features:", source_count)
+    UI.vprint(1, "   VEG_NORD water features skipped:", water_skipped)
+    if empty_skipped:
+        UI.vprint(1, "   VEG_NORD empty geometries skipped:", empty_skipped)
+
+    if src_srs is None or shared.is_empty:
+        UI.vprint(1, "   WARNING: no usable VEG_NORD terrestrial boundaries")
+        return 0
+
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    to_wgs84 = osr.CoordinateTransformation(src_srs, wgs84)
+
+    tile_lines = _transform_lines_to_tile_relative(
+        shared,
+        to_wgs84,
+        tile,
+    )
+
+    if tile_lines.is_empty:
+        UI.vprint(1, "   WARNING: transformed VEG_NORD boundaries are empty")
+        return 0
+
+    (
+        tile_lines,
+        hydro_count,
+        before_trim,
+        after_trim,
+    ) = _protect_hydro_constraints(tile_lines, vector_map)
+
+    UI.vprint(
+        1,
+        "   Hydro protection:",
+        hydro_count,
+        "hydro constraint lines /",
+        before_trim,
+        "->",
+        after_trim,
+        "VEG_NORD line parts",
+    )
+
+    if tile_lines.is_empty:
+        UI.vprint(1, "   WARNING: VEG_NORD boundaries empty after hydro protection")
+        return 0
+
+    # Difference against the hydro clearance corridor may split otherwise
+    # continuous chains. Re-merge degree-2 pieces before handing them to
+    # Ortho4XP. Again, no coordinates are moved.
+    tile_lines = _linemerge_multilines(tile_lines)
+
+    UI.vprint(
+        1,
+        "   VEG_NORD chains after hydro trim/merge:",
+        len(tile_lines.geoms),
+    )
+    UI.vprint(
+        1,
+        "   VEG_NORD vertices after hydro trim/merge:",
+        _vertex_count(tile_lines),
+    )
+
+    before = len(vector_map.dico_edges)
+
+    vector_map.encode_MultiLineString(
+        tile_lines,
+        tile.dem.alt_vec,
+        "DUMMY",
+        check=True,
+        refine=False,
+        skip_cut=False,
+    )
+
+    after = len(vector_map.dico_edges)
+
+    UI.vprint(1, "   VEG_NORD boundary lines encoded:", len(tile_lines.geoms))
+    UI.vprint(1, "   VEG_NORD constrained edges added:", after - before)
+
+    return 1
 
 
 def include_landcover_boundaries(
@@ -1235,6 +1692,20 @@ def include_landcover_boundaries(
         )
         return 0
 
+    ds = ogr.Open(gpkg_path, 0)
+    if ds is None:
+        UI.vprint(1, "   WARNING: cannot open Ullaaq landcover GeoPackage")
+        return 0
+
+    # VEG_NORD is a separate ingestion architecture.  Its source polygons are
+    # already professionally generalized and should bypass the legacy NALCMS
+    # dissolve/generalize/cache machinery entirely.
+    if ds.GetLayerByName("veg_nord") is not None:
+        result = _include_vegnord_boundaries(vector_map, tile, ds, gpkg_path)
+        ds = None
+        return result
+
+    # Legacy six-layer NALCMS path retained unchanged as a fallback/reference.
     UI.vprint(0, "-> Inserting Ullaaq landcover boundaries")
     UI.vprint(1, "   Source:", gpkg_path)
     UI.vprint(1, "   Simplification:", simplify_m, "m")
@@ -1258,11 +1729,6 @@ def include_landcover_boundaries(
     if cache_dir:
         UI.vprint(1, "   Cache:", cache_dir)
         UI.vprint(1, "   Cache status:", "warm" if cache_was_valid else "cold")
-
-    ds = ogr.Open(gpkg_path, 0)
-    if ds is None:
-        UI.vprint(1, "   WARNING: cannot open Ullaaq landcover GeoPackage")
-        return 0
 
     src_srs = None
     class_polys = []

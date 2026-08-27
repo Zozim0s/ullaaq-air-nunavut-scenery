@@ -1,0 +1,13 @@
+certifi==2026.7.22
+chardet==7.6.0
+charset-normalizer==3.5.1
+GDAL==3.12.2
+idna==3.19
+numpy==2.4.6
+pillow==12.3.0
+pyproj==3.7.2
+requests==2.34.2
+rtree==1.4.1
+scikit-fmm==2025.6.23
+shapely==2.1.2
+urllib3==2.7.0
