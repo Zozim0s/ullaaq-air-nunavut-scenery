@@ -1,0 +1,14 @@
+A
+800
+TERRAIN
+BASE_TEX ../textures/hiveg/rcml_test_base.png
+BORDER_TEX ../textures/border/soft.png
+PROJECTED 1673 1673
+SUPER_ROUGHNESS 0.5
+COMPOSITE_TEX ../textures/hiveg/rcml_test_composite.png
+COMPOSITE_PROJECTED 1673 1673
+COMPOSITE_PARAMS 0.104000 0.850000 0.248000 1.820000 2.050000 0.260000
+COMPOSITE_NOISE ../textures/shared/natnoise.png
+NO_ALPHA
+COMPOSITE_BORDERS
+DECAL_LIB lib/g10/decals/maquify_1_alpha_key.dcl
