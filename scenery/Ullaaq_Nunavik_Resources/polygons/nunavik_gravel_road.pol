@@ -1,0 +1,9 @@
+A
+850
+DRAPED_POLYGON
+
+TEXTURE ../textures/roads/nunavik_gravel_test.png
+SCALE 8 8
+NO_ALPHA
+LAYER_GROUP roads 0
+SURFACE gravel

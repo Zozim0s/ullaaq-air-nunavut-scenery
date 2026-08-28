@@ -3,3 +3,6 @@ A
 LIBRARY
 
 EXPORT lib/ullaaq/terrain/rcml_test.ter terrain/ullaaq_rcml_test.ter
+EXPORT lib/ullaaq/roads/nunavik.net roads/nunavik.net
+EXPORT lib/ullaaq/roads/gravel_surface.pol polygons/nunavik_gravel_road.pol
+EXPORT lib/ullaaq/terrain/ih_test.ter terrain/ullaaq_ih_test.ter

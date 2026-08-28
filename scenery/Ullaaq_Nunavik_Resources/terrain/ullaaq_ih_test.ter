@@ -1,11 +1,11 @@
 A
 800
 TERRAIN
-BASE_TEX ../textures/hiveg/coni_cld_dry_flat_c.dds
+BASE_TEX ../textures/roads/ih_ground_test.png
 BORDER_TEX ../textures/border/soft.png
 PROJECTED 1673 1673
 SUPER_ROUGHNESS 0.5
-COMPOSITE_TEX ../textures/hiveg/coni_cld_dry_flat_c2.dds
+COMPOSITE_TEX ../textures/roads/ih_ground_test.png
 COMPOSITE_PROJECTED 1673 1673
 COMPOSITE_PARAMS 0.104000 0.850000 0.248000 1.820000 2.050000 0.260000
 COMPOSITE_NOISE ../textures/shared/natnoise.png

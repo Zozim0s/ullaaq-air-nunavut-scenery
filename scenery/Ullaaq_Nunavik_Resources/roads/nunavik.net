@@ -1,0 +1,12 @@
+A
+800
+ROADS
+
+ONE_SIDED
+
+TEXTURE 3 ../textures/roads/nunavik_gravel_test.png
+
+ROAD_TYPE 50 7.0 24.0 0 0.55 0.55 0.55
+ROAD_CENTER 3.5
+
+SEGMENT_DRAPED 0 0 30000 1.0 -3.5 0.0 3.5 1.0
