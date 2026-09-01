@@ -1,0 +1,8 @@
+A
+800
+TERRAIN
+BASE_TEX ../textures/hiveg/rmc_AB_1024.png
+BORDER_TEX ../textures/border/soft.png
+PROJECTED 1673 1673
+SUPER_ROUGHNESS 0.5
+NO_ALPHA

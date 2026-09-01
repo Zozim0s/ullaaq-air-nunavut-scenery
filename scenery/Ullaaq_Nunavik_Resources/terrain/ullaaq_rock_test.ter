@@ -1,0 +1,12 @@
+A
+800
+TERRAIN
+
+BASE_TEX ../textures/rock/rock_qc_A_seam_v1_1024.png
+BORDER_TEX ../textures/shared/hard.png
+DECAL_LIB lib/ullaaq/decals/bedrock_v1.dcl
+PROJECTED 1248 1248
+SUPER_ROUGHNESS 0.5
+AUTO_HEADING
+NO_ALPHA
+COMPOSITE_BORDERS
