@@ -9,3 +9,5 @@ EXPORT lib/ullaaq/terrain/ih_test.ter terrain/ullaaq_ih_test.ter
 EXPORT lib/ullaaq/terrain/rock_test.ter terrain/ullaaq_rock_test.ter
 EXPORT lib/ullaaq/decals/bedrock_v1.dcl decals/ullaaq_bedrock_v1.dcl
 EXPORT lib/ullaaq/terrain/rmc_test.ter terrain/ullaaq_rmc_test.ter
+EXPORT lib/ullaaq/forests/rmc_spruce_test.for forests/ullaaq_rmc_spruce_test.for
+EXPORT lib/ullaaq/forests/tam_test.for forests/ullaaq_tam_test_.for

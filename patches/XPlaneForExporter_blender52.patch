@@ -1,0 +1,74 @@
+--- a/io_scene_xplane_for/forest_tables.py
++++ b/io_scene_xplane_for/forest_tables.py
+@@ -65,7 +65,8 @@
+     dg = bpy.context.evaluated_depsgraph_get()
+     eval_obj = complex_object.evaluated_get(dg)
+     mesh = eval_obj.to_mesh(preserve_all_data_layers=False, depsgraph=dg)
+-    mesh.calc_normals_split()
++    if hasattr(mesh, "calc_normals_split"):
++        mesh.calc_normals_split()
+     mesh.calc_loop_triangles()
+ 
+     def make_tmp_faces(mesh: bpy.types.Mesh) -> Iterable[_TmpFace]:
+--- a/io_scene_xplane_for/forest_header.py
++++ b/io_scene_xplane_for/forest_header.py
+@@ -1,4 +1,5 @@
+ import pathlib
++import os
+ import itertools
+ import functools
+ import dataclasses
+@@ -163,12 +164,47 @@
+     ) -> str:
+         """Where shader_type is 'SHADER_2D' or 'SHADER_3D'"""
+         mat_settings = shader_material.xplane_for
+-        # TODO: pathlib this!
+-        texture_path = mat_settings.texture_path.replace("//", "").replace("\\", "/")
+-        texture_path_normal = mat_settings.texture_path_normal.replace(
+-            "//", ""
+-        ).replace("\\", "/")
+-        texture_path_weather = mat_settings.texture_path_weather.replace("//", "").replace("\\", "/")
++        def export_texture_path(raw_path: str) -> str:
++            """Return an X-Plane texture path relative to the exported .for file."""
++            if not raw_path:
++                return ""
++
++            raw_path = raw_path.replace("\\", "/")
++            raw = pathlib.Path(raw_path)
++
++            # Blender // paths are relative to the .blend file.  Some file-picker
++            # combinations have also produced //linGames/... for paths below $HOME,
++            # so recover that form when the blend-relative candidate does not exist.
++            if raw_path.startswith("//"):
++                blend_relative = pathlib.Path(bpy.path.abspath(raw_path))
++                home_relative = pathlib.Path.home() / raw_path[2:]
++
++                if blend_relative.exists():
++                    texture_abs = blend_relative.resolve()
++                elif home_relative.exists():
++                    texture_abs = home_relative.resolve()
++                else:
++                    texture_abs = blend_relative.resolve()
++
++            elif raw.is_absolute():
++                texture_abs = raw.expanduser().resolve()
++
++            else:
++                texture_abs = pathlib.Path(bpy.path.abspath(raw_path)).resolve()
++
++            forest_name = pathlib.Path(self.forest_file.file_name).expanduser()
++            if not forest_name.is_absolute():
++                forest_name = pathlib.Path(bpy.path.abspath("//")) / forest_name
++
++            forest_dir = forest_name.resolve().parent
++
++            return pathlib.Path(
++                os.path.relpath(texture_abs, forest_dir)
++            ).as_posix()
++
++        texture_path = export_texture_path(mat_settings.texture_path)
++        texture_path_normal = export_texture_path(mat_settings.texture_path_normal)
++        texture_path_weather = export_texture_path(mat_settings.texture_path_weather)
+         # get luma values
+         luma = ''
+         for i in range(0, 4):
