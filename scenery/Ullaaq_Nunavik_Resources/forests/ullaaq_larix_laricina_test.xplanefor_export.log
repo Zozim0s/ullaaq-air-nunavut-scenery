@@ -1,0 +1,3 @@
+Ullaaq Northern Trees - EXPORT FAILED
+Source: NORTHERN_TREE_CARD_NATIVE_V10I_UPFOLD_REVERSED_WINDING_TEST
+RuntimeError: Known-good XPlaneForExporter rig is incomplete. Missing: TAMARACK_TEST_mesh, TAMARACK_TEST, TAMARACK_TEST_billboard

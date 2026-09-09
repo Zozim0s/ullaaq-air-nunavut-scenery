@@ -1,0 +1,14 @@
+Ullaaq Northern Trees - DIRECT .for EXPORT
+Source: NORTHERN_TREE_CARD_NATIVE_V10I_UPFOLD_REVERSED_WINDING_TEST
+Triangles: 124
+Vertices: 372
+X: -0.0364 .. 0.0364 m
+Y: -0.0002 .. 3.0004 m [vertical]
+Z: -0.0364 .. 0.0364 m
+TREE height: 3.0006 .. 3.0006 m
+MESH wind: bend=0.0 max_disp=0.0 speed=0.0
+Mesh-part filter: TRUNK
+Normals: geometric face normals
+WROTE: /home/mike/linGames/Ullaaq-Air-Nunavik/scenery/Ullaaq_Nunavik_Resources/forests/ullaaq_larix_laricina_test.for
+LOG: /home/mike/linGames/Ullaaq-Air-Nunavik/scenery/Ullaaq_Nunavik_Resources/forests/ullaaq_larix_laricina_test.export.log
+Ready for X-Plane reload.
