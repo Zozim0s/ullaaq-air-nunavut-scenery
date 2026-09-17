@@ -14,4 +14,3 @@ COMPOSITE_NOISE ../textures/shared/natnoise.png
 
 NO_ALPHA
 COMPOSITE_BORDERS
-DECAL_LIB lib/g10/decals/maquify_1_alpha_key.dcl
